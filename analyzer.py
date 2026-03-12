@@ -9,10 +9,11 @@ import torch
 import piexif
 from datetime import datetime
 from PIL.ExifTags import TAGS
-from transformers import BlipProcessor, BlipForConditionalGeneration
+from transformers import BlipProcessor, BlipForConditionalGeneration, AutoProcessor, AutoModelForCausalLM
 from sentence_transformers import SentenceTransformer, util
 from functools import lru_cache
 import warnings
+from model_config import MODEL_TIERS, TIER_THRESHOLDS, DEFAULT_TIER
 
 try:
     from pillow_heif import register_heif_opener
@@ -24,68 +25,110 @@ except ImportError:
 warnings.filterwarnings("ignore", category=UserWarning, module="PIL.TiffImagePlugin")
 
 class ImageAnalyzer:
-    def __init__(self):
-        print("Initializing AI models... This might take a moment.")
-        
+    def __init__(self, tier: str = DEFAULT_TIER, threshold_overrides: dict = None):
+        """
+        tier: "fast" | "smart" | "modern"  (from model_config.MODEL_TIERS)
+        threshold_overrides: dict of {key: float} from settings.json, overrides TIER_THRESHOLDS defaults
+        """
+        print(f"Initializing AI models (tier: {tier})... This might take a moment.")
+
         self.torch = torch
         self.util = util
-        
-        # OFFLINE SUPPORT: Check for local models first
-        # Use the script's own directory so models are found regardless of working directory
-        local_models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
-        
+        self.tier = tier
+
+        cfg = MODEL_TIERS[tier]
+        self.blip_type = cfg["blip_type"]
+
+        # Merge per-tier default thresholds with any user overrides
+        base = dict(TIER_THRESHOLDS[tier])
+        if threshold_overrides:
+            base.update(threshold_overrides)
+        self.thr = base  # e.g. self.thr["doc"], self.thr["fewshot"]
+
+        # --- Model path resolution ---
+        # Priority: 1) bundled (_MEIPASS/models/)  2) user cache (~/.photoai/models/)  3) Hub download
+        user_cache = os.path.join(os.path.expanduser("~"), ".photoai", "models")
+        os.makedirs(user_cache, exist_ok=True)
+
+        bundled_dir = None
         if getattr(sys, 'frozen', False):
-            # PyInstaller creates a temp folder in _MEIPASS
-            base_path = sys._MEIPASS
-            local_models_dir = os.path.join(base_path, "models")
-            
-            # LITE VERSION: If models not in bundle, use cache in user home
-            if not os.path.exists(local_models_dir):
-                cache_dir = os.path.join(os.path.expanduser("~"), ".photoai", "models")
-                os.makedirs(cache_dir, exist_ok=True)
-                local_models_dir = cache_dir
+            candidate = os.path.join(sys._MEIPASS, "models")
+            if os.path.exists(candidate):
+                bundled_dir = candidate
+
+        def resolve_model_dir(dir_name):
+            """Return first existing path for a model directory, else user cache path (for download)."""
+            if bundled_dir:
+                p = os.path.join(bundled_dir, dir_name)
+                if os.path.exists(p):
+                    return p, True   # (path, is_local)
+            p = os.path.join(user_cache, dir_name)
+            return p, os.path.exists(p)
 
         # Move to GPU if available
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        
+
         # 1. Load CLIP
-        clip_local = os.path.join(local_models_dir, "clip-ViT-B-32")
-        if os.path.exists(clip_local):
-            print(f"Loading CLIP from local bundle: {clip_local}")
-            # Pass device to constructor to avoid .to() errors later
-            self.similarity_model = SentenceTransformer(clip_local, device=self.device)
+        clip_path, clip_exists = resolve_model_dir(cfg["clip_dir"])
+        if clip_exists:
+            print(f"Loading CLIP from: {clip_path}")
+            self.similarity_model = SentenceTransformer(clip_path, device=self.device)
         else:
-            print("Downloading CLIP from Hub...")
-            # Download and cache in local_models_dir
-            self.similarity_model = SentenceTransformer('clip-ViT-B-32', device=self.device, cache_folder=local_models_dir)
-        
+            print(f"Downloading CLIP ({cfg['clip_id']}) to {clip_path}...")
+            self.similarity_model = SentenceTransformer(cfg["clip_id"], device=self.device, cache_folder=user_cache)
+
         # --- FEW-SHOT LEARNING STORAGE ---
         self.ref_file = os.path.join(os.path.expanduser("~"), ".photoai", "reference_embeddings.json")
         self.references = self.load_references()
 
-        # 2. Load BLIP
-        blip_local = os.path.join(local_models_dir, "blip-base")
+        # 2. Load caption model (BLIP or Florence-2)
+        caption_path, caption_exists = resolve_model_dir(cfg["blip_dir"])
         try:
-            if os.path.exists(blip_local):
-                print(f"Loading BLIP from local bundle: {blip_local}")
-                self.processor = BlipProcessor.from_pretrained(blip_local)
-                self.model = BlipForConditionalGeneration.from_pretrained(blip_local).to(self.device).to(torch.float32)
+            if self.blip_type == "florence2":
+                self._load_florence2(caption_path, caption_exists, cfg)
             else:
-                print("Downloading BLIP from Hub...")
-                # Download and cache in local_models_dir
-                self.processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base", cache_dir=local_models_dir)
-                self.model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base", cache_dir=local_models_dir).to(self.device).to(torch.float32)
-            
+                self._load_blip(caption_path, caption_exists, cfg)
         except Exception as e:
             print(f"Warning: GPU load failed, falling back to CPU. Error: {e}")
             self.device = "cpu"
-            # Fallback re-load for CPU safety
-            if os.path.exists(blip_local):
-                 self.model = BlipForConditionalGeneration.from_pretrained(blip_local, low_cpu_mem_usage=False)
+            if self.blip_type == "florence2":
+                self._load_florence2(caption_path, caption_exists, cfg)
             else:
-                 self.model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base", cache_dir=local_models_dir, low_cpu_mem_usage=False)
-        
-        print(f"Models loaded on {self.device}.")
+                self._load_blip(caption_path, caption_exists, cfg, cpu_fallback=True)
+
+        print(f"Models loaded on {self.device} (tier: {self.tier}).")
+
+    def _load_blip(self, path, exists, cfg, cpu_fallback=False):
+        if exists:
+            print(f"Loading BLIP from: {path}")
+            self.caption_processor = BlipProcessor.from_pretrained(path)
+            self.caption_model = BlipForConditionalGeneration.from_pretrained(
+                path, low_cpu_mem_usage=cpu_fallback
+            ).to(self.device).to(torch.float32)
+        else:
+            print(f"Downloading BLIP ({cfg['blip_id']})...")
+            user_cache = os.path.join(os.path.expanduser("~"), ".photoai", "models")
+            self.caption_processor = BlipProcessor.from_pretrained(cfg["blip_id"], cache_dir=user_cache)
+            self.caption_model = BlipForConditionalGeneration.from_pretrained(
+                cfg["blip_id"], cache_dir=user_cache, low_cpu_mem_usage=cpu_fallback
+            ).to(self.device).to(torch.float32)
+
+    def _load_florence2(self, path, exists, cfg):
+        if exists:
+            print(f"Loading Florence-2 from: {path}")
+            self.caption_processor = AutoProcessor.from_pretrained(path, trust_remote_code=True)
+            self.caption_model = AutoModelForCausalLM.from_pretrained(
+                path, trust_remote_code=True
+            ).to(self.device).to(torch.float32)
+        else:
+            print(f"Downloading Florence-2 ({cfg['blip_id']})...")
+            user_cache = os.path.join(os.path.expanduser("~"), ".photoai", "models")
+            self.caption_processor = AutoProcessor.from_pretrained(
+                cfg["blip_id"], cache_dir=user_cache, trust_remote_code=True
+            )
+            self.caption_model = AutoModelForCausalLM.from_pretrained(
+                cfg["blip_id"], cache_dir=user_cache, trust_remote_code=True
+            ).to(self.device).to(torch.float32)
 
         # --- 2.2 PRE-CALCULATE PROMPTS (Optimization) ---
         # Memes / Screenshots / Forwards
@@ -193,8 +236,8 @@ class ImageAnalyzer:
                     best_score = max_score
                     best_cat = category
             
-            # Threshold: Must be very similar to a known example (0.92)
-            if best_score > 0.90:
+            # Threshold: Must be very similar to a known example
+            if best_score > self.thr["fewshot"]:
                 print(f"Custom Match: {best_cat} ({best_score:.3f})")
                 return best_cat
             
@@ -326,14 +369,28 @@ class ImageAnalyzer:
         """
         Returns a list of keyword tags/descriptions for the image.
         Extracts meaningful keywords from the generated caption.
+        Supports both BLIP and Florence-2 caption models.
         """
         try:
             image = self._get_image(img_path)
             if image is None: return []
-            inputs = self.processor(image, return_tensors="pt").to(self.device)
-            
-            out = self.model.generate(**inputs)
-            caption = self.processor.decode(out[0], skip_special_tokens=True)
+
+            if self.blip_type == "florence2":
+                inputs = self.caption_processor(
+                    text="<DETAILED_CAPTION>", images=image, return_tensors="pt"
+                ).to(self.device)
+                out = self.caption_model.generate(
+                    input_ids=inputs["input_ids"],
+                    pixel_values=inputs["pixel_values"],
+                    max_new_tokens=64,
+                )
+                raw = self.caption_processor.batch_decode(out, skip_special_tokens=True)[0]
+                # Florence-2 wraps output in task token — strip it
+                caption = raw.replace("<DETAILED_CAPTION>", "").strip()
+            else:
+                inputs = self.caption_processor(image, return_tensors="pt").to(self.device)
+                out = self.caption_model.generate(**inputs)
+                caption = self.caption_processor.decode(out[0], skip_special_tokens=True)
             
             # Extract keywords from caption
             # Remove common articles and prepositions
@@ -391,7 +448,7 @@ class ImageAnalyzer:
             neg_score = sims[len(prompts):].mean()
 
             # Stricter threshold: Must clearly be a document (0.05 buffer)
-            return pos_score > (neg_score + 0.05)
+            return pos_score > (neg_score + self.thr["doc"])
             
         except Exception as e:
             print(f"Error detecting document: {e}")
@@ -432,8 +489,7 @@ class ImageAnalyzer:
             neg_score = sims[len(prompts):].max()
             
             # Threshold: Must be somewhat confident it's PII
-            # Lowered to 0.23 to catch scan files while relying on negatives to filter memes
-            return (pos_score > 0.23) and (pos_score > neg_score)
+            return (pos_score > self.thr["pii"]) and (pos_score > neg_score)
             
         except Exception as e:
             print(f"Error detecting PII: {e}")
@@ -606,7 +662,7 @@ class ImageAnalyzer:
             pos_score = sims[:len(self._prompts_meme)].max()
             neg_score = sims[len(self._prompts_meme):].max()
             
-            return (pos_score > 0.24) and (pos_score > neg_score)
+            return (pos_score > self.thr["meme"]) and (pos_score > neg_score)
 
         except Exception as e:
             print(f"Error in is_meme_or_screenshot for {os.path.basename(img_path)}: {e}")
@@ -636,7 +692,7 @@ class ImageAnalyzer:
             pos_score = sims[:len(prompts)].max()
             neg_score = sims[len(prompts):].max()
             
-            return (pos_score > 0.25) and (pos_score > neg_score)
+            return (pos_score > self.thr["screenshot"]) and (pos_score > neg_score)
         except Exception as e:
             print(f"Error in is_screenshot for {os.path.basename(img_path)}: {e}")
             return False
@@ -668,9 +724,7 @@ class ImageAnalyzer:
             pos_score = sims[:len(prompts)].max()
             neg_score = sims[len(prompts):].max()
             
-            # Lower threshold as these are distinct from photos (0.24)
-            # Increase slightly to prevent photos from leaking in
-            return (pos_score > 0.24) and (pos_score > neg_score)
+            return (pos_score > self.thr["meme"]) and (pos_score > neg_score)
         except Exception as e:
             print(f"Error in is_likely_forward_visual for {os.path.basename(img_path)}: {e}")
             return False
