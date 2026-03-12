@@ -77,6 +77,9 @@ class ImageAnalyzer:
             print(f"Downloading CLIP ({cfg['clip_id']}) to {clip_path}...")
             self.similarity_model = SentenceTransformer(cfg["clip_id"], device=self.device, cache_folder=user_cache)
 
+        # Store embedding dimension so we can detect stale references after a tier change
+        self.clip_dim = self.similarity_model.get_sentence_embedding_dimension()
+
         # --- FEW-SHOT LEARNING STORAGE ---
         self.ref_file = os.path.join(os.path.expanduser("~"), ".photoai", "reference_embeddings.json")
         self.references = self.load_references()
@@ -186,13 +189,36 @@ class ImageAnalyzer:
             return None
 
     def load_references(self):
-        """Loads user-corrected reference embeddings from JSON."""
+        """Loads user-corrected reference embeddings from JSON.
+        Clears stale data automatically if the saved embedding dimension
+        doesn't match the currently loaded CLIP model (e.g. after a tier change).
+        """
         if not os.path.exists(self.ref_file):
             return {}
         try:
             with open(self.ref_file, 'r') as f:
                 data = json.load(f)
-                return data
+            saved_dim = data.pop("_dim", None)
+            # If dim was recorded and mismatches — stale, clear
+            if saved_dim is not None and saved_dim != self.clip_dim:
+                print(
+                    f"Clearing few-shot references: saved dimension ({saved_dim}) "
+                    f"doesn't match current CLIP model ({self.clip_dim}). "
+                    f"Please re-teach your custom categories."
+                )
+                return {}
+            # If no dim recorded, probe the first embedding to detect legacy mismatch
+            if saved_dim is None:
+                for embeddings in data.values():
+                    if embeddings and len(embeddings[0]) != self.clip_dim:
+                        print(
+                            f"Clearing few-shot references: legacy embeddings have "
+                            f"dimension {len(embeddings[0])}, current model uses {self.clip_dim}. "
+                            f"Please re-teach your custom categories."
+                        )
+                        return {}
+                    break  # only need to check one
+            return data
         except Exception as e:
             print(f"Error loading references: {e}")
             return {}
@@ -586,7 +612,7 @@ class ImageAnalyzer:
             
             os.makedirs(os.path.dirname(self.ref_file), exist_ok=True)
             with open(self.ref_file, 'w') as f:
-                json.dump(self.references, f)
+                json.dump({"_dim": self.clip_dim, **self.references}, f)
             
             print(f"Learned: {os.path.basename(img_path)} is {category}")
             return True
