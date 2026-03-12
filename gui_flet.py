@@ -10,7 +10,7 @@ import imagehash
 from analyzer import ImageAnalyzer
 from history_manager import HistoryManager
 from settings_manager import SettingsManager
-from model_config import MODEL_TIERS, TIER_THRESHOLDS, THRESHOLD_LABELS, THRESHOLD_RANGES, DEFAULT_TIER, get_total_size_mb, format_size
+from model_config import MODEL_TIERS, TIER_THRESHOLDS, THRESHOLD_LABELS, THRESHOLD_RANGES, DEFAULT_TIER, format_size
 from scripts.download_models import download_tier, get_cache_status
 
 import base64
@@ -283,78 +283,158 @@ def main(page: ft.Page):
 
     # Define open_settings here
     def open_settings():
-        # ── Theme section ──────────────────────────────────────────
-        theme_radio = ft.RadioGroup(
-            content=ft.Column([
-                ft.Radio(value="Dark", label="Dark (Default)"),
-                ft.Radio(value="Light", label="Light"),
-                ft.Radio(value="Iron Man", label="Iron Man (HUD)"),
-            ]),
-            value=state.current_theme,
-            on_change=lambda e: apply_theme(e.data)
-        )
-
-        # ── AI Models section ──────────────────────────────────────
         cache = get_cache_status()
-
-        def _cache_badge(tier):
-            clip_ok = cache[tier]["clip"]
-            blip_ok = cache[tier]["blip"]
-            if clip_ok and blip_ok:
-                return ft.Container(
-                    ft.Text("Cached", size=10, color="#4ADE80", weight=ft.FontWeight.W_600),
-                    padding=ft.padding.symmetric(vertical=2, horizontal=7),
-                    border_radius=10, border=ft.border.all(1, "#4ADE80"),
-                )
-            size_mb = get_total_size_mb(tier)
-            # If CLIP already cached (shared), only caption needs download
-            if tier == "modern" and cache["smart"]["clip"]:
-                size_mb = MODEL_TIERS["modern"]["blip_size_mb"]
-            return ft.Container(
-                ft.Text(format_size(size_mb), size=10, color="#FACC15", weight=ft.FontWeight.W_600),
-                padding=ft.padding.symmetric(vertical=2, horizontal=7),
-                border_radius=10, border=ft.border.all(1, "#FACC15"),
-                tooltip="Download needed",
-            )
 
         selected_tier = ft.Ref[str]()
         selected_tier.current = state.model_tier
-
         tier_cards = {}
+        thr_sliders = {}
+        thr_labels = {}
+
         apply_btn = ft.ElevatedButton(
             "Apply", disabled=True,
             style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=8)),
         )
 
-        def _make_tier_card(tier_key):
+        # ── Helpers ────────────────────────────────────────────────
+        def _cache_badge(tier, role):
+            cached = cache[tier]["clip"] if role == "clip" else cache[tier]["blip"]
+            color = "#4ADE80" if cached else "#FACC15"
+            label = "Cached" if cached else "Download"
+            return ft.Container(
+                ft.Text(label, size=10, color=color, weight=ft.FontWeight.W_600),
+                padding=ft.padding.symmetric(vertical=1, horizontal=6),
+                border_radius=8, border=ft.border.all(1, color),
+            )
+
+        def _thresholds_dirty():
+            for key, slider in thr_sliders.items():
+                saved = state.thresholds.get(key, TIER_THRESHOLDS[selected_tier.current][key])
+                if round(slider.value, 3) != round(saved, 3):
+                    return True
+            return False
+
+        # ── RIGHT PANEL (rebuilt on tier change) ───────────────────
+        right_panel = ft.Column(spacing=10, expand=True)
+
+        def _build_right_panel():
+            right_panel.controls.clear()
+            thr_sliders.clear()
+            thr_labels.clear()
+            tier_key = selected_tier.current
             cfg = MODEL_TIERS[tier_key]
-            is_active = (tier_key == state.model_tier)
-            card = ft.Container(
-                ft.Row([
-                    # Left: icon + name + tagline
+
+            # Section: Model Details
+            right_panel.controls.append(
+                ft.Text("Model Details", size=12, weight=ft.FontWeight.W_700, color="#E0E0E0")
+            )
+
+            def _model_card(role, model_id, params, size_mb, role_key):
+                badge = _cache_badge(tier_key, role_key)
+                return ft.Container(
                     ft.Column([
                         ft.Row([
-                            ft.Text(cfg["icon"], size=20),
-                            ft.Text(cfg["display_name"], size=14, weight=ft.FontWeight.W_600),
-                        ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                        ft.Text(cfg["tagline"], size=11, color="#A0A8C0"),
-                    ], spacing=3, expand=True),
-                    # Right: size + cache badge
-                    ft.Column([
-                        _cache_badge(tier_key),
-                        ft.Text(
-                            format_size(cfg["clip_size_mb"] + cfg["blip_size_mb"]),
-                            size=11, color="#6B7280",
-                        ),
-                    ], spacing=4, horizontal_alignment=ft.CrossAxisAlignment.END),
+                            ft.Text(role, size=11, color="#7C6FF7",
+                                    weight=ft.FontWeight.W_700, width=54),
+                            ft.Text(model_id, size=11, weight=ft.FontWeight.W_500,
+                                    expand=True, overflow=ft.TextOverflow.ELLIPSIS),
+                            badge,
+                        ], vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=6),
+                        ft.Row([
+                            ft.Container(width=54),
+                            ft.Text(f"{params}  ·  {format_size(size_mb)}",
+                                    size=10, color="#6B7280"),
+                        ]),
+                    ], spacing=3, tight=True),
+                    padding=ft.padding.symmetric(vertical=8, horizontal=10),
+                    border_radius=6, bgcolor="#13151F",
+                )
+
+            right_panel.controls.append(_model_card(
+                "CLIP", cfg["clip_id"], cfg["clip_params"], cfg["clip_size_mb"], "clip"
+            ))
+            right_panel.controls.append(_model_card(
+                "Caption", cfg["blip_id"], cfg["blip_params"], cfg["blip_size_mb"], "blip"
+            ))
+
+            # Section: Detection Thresholds
+            right_panel.controls.append(ft.Container(height=2))
+            right_panel.controls.append(
+                ft.Row([
+                    ft.Text("Detection Thresholds", size=12,
+                            weight=ft.FontWeight.W_700, color="#E0E0E0"),
+                    ft.TextButton(
+                        "Reset",
+                        style=ft.ButtonStyle(padding=ft.padding.symmetric(0, 4)),
+                        on_click=_reset_thresholds,
+                    ),
                 ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                   vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                padding=ft.padding.symmetric(vertical=10, horizontal=14),
+                   vertical_alignment=ft.CrossAxisAlignment.CENTER)
+            )
+
+            for key, label in THRESHOLD_LABELS.items():
+                lo, hi = THRESHOLD_RANGES[key]
+                saved = state.thresholds.get(key, TIER_THRESHOLDS[tier_key][key])
+                lbl = ft.Text(f"{saved:.2f}", size=12, color="#7C6FF7",
+                              weight=ft.FontWeight.W_600, width=34)
+                thr_labels[key] = lbl
+
+                def _on_change(e, k=key):
+                    thr_labels[k].value = f"{e.control.value:.2f}"
+                    thr_labels[k].update()
+                    apply_btn.disabled = (
+                        selected_tier.current == state.model_tier and not _thresholds_dirty()
+                    )
+                    apply_btn.update()
+
+                slider = ft.Slider(
+                    min=lo, max=hi, value=saved, divisions=int((hi - lo) * 100),
+                    on_change=_on_change,
+                    active_color="#7C6FF7", thumb_color="#7C6FF7",
+                    expand=True, height=28,
+                )
+                thr_sliders[key] = slider
+                right_panel.controls.append(
+                    ft.Column([
+                        ft.Row([
+                            ft.Text(label, size=11, color="#A0A8C0", expand=True),
+                            lbl,
+                        ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                        slider,
+                    ], spacing=0, tight=True)
+                )
+
+        def _reset_thresholds(_):
+            tier_key = selected_tier.current
+            for key, slider in thr_sliders.items():
+                d = TIER_THRESHOLDS[tier_key][key]
+                slider.value = d
+                thr_labels[key].value = f"{d:.2f}"
+            right_panel.update()
+            apply_btn.disabled = (tier_key == state.model_tier and not _thresholds_dirty())
+            apply_btn.update()
+
+        # ── LEFT PANEL ────────────────────────────────────────────
+        def _make_tier_card(tier_key):
+            cfg = MODEL_TIERS[tier_key]
+            is_sel = (tier_key == selected_tier.current)
+            card = ft.Container(
+                ft.Column([
+                    ft.Row([
+                        ft.Text(cfg["icon"], size=18),
+                        ft.Text(cfg["display_name"], size=13, weight=ft.FontWeight.W_600),
+                    ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    ft.Text(cfg["tagline"], size=10, color="#A0A8C0"),
+                    ft.Text(
+                        format_size(cfg["clip_size_mb"] + cfg["blip_size_mb"]),
+                        size=10, color="#6B7280",
+                    ),
+                ], spacing=3, tight=True),
+                padding=ft.padding.symmetric(vertical=9, horizontal=12),
                 border_radius=8,
-                border=ft.border.all(2 if is_active else 1, "#7C6FF7" if is_active else "#2D3244"),
-                bgcolor="#1A1D27" if is_active else "#13151F",
+                border=ft.border.all(2 if is_sel else 1, "#7C6FF7" if is_sel else "#2D3244"),
+                bgcolor="#1A1D27" if is_sel else "#13151F",
                 on_click=lambda e, k=tier_key: _select_tier(k),
-                data=tier_key,
             )
             tier_cards[tier_key] = card
             return card
@@ -362,175 +442,52 @@ def main(page: ft.Page):
         def _select_tier(tier_key):
             selected_tier.current = tier_key
             for k, c in tier_cards.items():
-                is_sel = (k == tier_key)
-                c.border = ft.border.all(2 if is_sel else 1, "#7C6FF7" if is_sel else "#2D3244")
-                c.bgcolor = "#1A1D27" if is_sel else "#13151F"
+                sel = (k == tier_key)
+                c.border = ft.border.all(2 if sel else 1, "#7C6FF7" if sel else "#2D3244")
+                c.bgcolor = "#1A1D27" if sel else "#13151F"
                 c.update()
+            _build_right_panel()
+            right_panel.update()
             apply_btn.disabled = (tier_key == state.model_tier and not _thresholds_dirty())
             apply_btn.update()
 
-        # ── Advanced panel ─────────────────────────────────────────
-        adv_visible = ft.Ref[bool]()
-        adv_visible.current = False
-        adv_panel = ft.Column(visible=False, spacing=8)
-
-        # Threshold sliders — keyed by threshold name
-        thr_sliders = {}
-        thr_labels = {}
-
-        def _thresholds_dirty():
-            for key, slider in thr_sliders.items():
-                default = TIER_THRESHOLDS[selected_tier.current][key]
-                saved = state.thresholds.get(key, default)
-                if round(slider.value, 3) != round(saved, 3):
-                    return True
-            return False
-
-        def _build_adv_panel():
-            adv_panel.controls.clear()
-            tier_key = selected_tier.current
-            cfg = MODEL_TIERS[tier_key]
-
-            # ── Model info table ───────────────────────────────────
-            adv_panel.controls.append(ft.Divider(color="#2D3244", height=1))
-            adv_panel.controls.append(
-                ft.Text("Model Details", size=12, weight=ft.FontWeight.W_600, color="#E0E0E0")
-            )
-
-            def _model_row(role, model_id, params, size_mb, tier_k):
-                cached = cache[tier_k]["clip"] if role == "CLIP" else cache[tier_k]["blip"]
-                badge = ft.Container(
-                    ft.Text("Cached" if cached else "Not downloaded", size=10,
-                            color="#4ADE80" if cached else "#FACC15",
-                            weight=ft.FontWeight.W_600),
-                    padding=ft.padding.symmetric(vertical=1, horizontal=6),
-                    border_radius=8,
-                    border=ft.border.all(1, "#4ADE80" if cached else "#FACC15"),
-                )
-                return ft.Container(
-                    ft.Column([
-                        ft.Row([
-                            ft.Text(role, size=11, color="#7C6FF7", weight=ft.FontWeight.W_600, width=58),
-                            ft.Text(model_id, size=12, weight=ft.FontWeight.W_500, expand=True),
-                            badge,
-                        ], vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=8),
-                        ft.Row([
-                            ft.Container(width=58),
-                            ft.Text(f"{params}  ·  {format_size(size_mb)}", size=11, color="#6B7280"),
-                        ]),
-                    ], spacing=2, tight=True),
-                    padding=ft.padding.symmetric(vertical=8, horizontal=10),
-                    border_radius=6,
-                    bgcolor="#13151F",
-                )
-
-            adv_panel.controls.append(_model_row(
-                "CLIP", cfg["clip_id"], cfg["clip_params"], cfg["clip_size_mb"], tier_key
-            ))
-            adv_panel.controls.append(_model_row(
-                "Caption", cfg["blip_id"], cfg["blip_params"], cfg["blip_size_mb"], tier_key
-            ))
-
-            # ── Threshold sliders ──────────────────────────────────
-            adv_panel.controls.append(ft.Container(height=4))
-            adv_panel.controls.append(
-                ft.Row([
-                    ft.Text("Detection Thresholds", size=12, weight=ft.FontWeight.W_600, color="#E0E0E0"),
-                    ft.TextButton(
-                        "Reset to defaults",
-                        style=ft.ButtonStyle(padding=ft.padding.all(0)),
-                        on_click=_reset_thresholds,
-                    ),
-                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
-            )
-
-            thr_sliders.clear()
-            thr_labels.clear()
-            for key, label in THRESHOLD_LABELS.items():
-                lo, hi = THRESHOLD_RANGES[key]
-                saved = state.thresholds.get(key, TIER_THRESHOLDS[tier_key][key])
-                lbl = ft.Text(f"{saved:.2f}", size=12, color="#7C6FF7", weight=ft.FontWeight.W_600)
-                thr_labels[key] = lbl
-
-                def _on_thr_change(e, k=key):
-                    thr_labels[k].value = f"{e.control.value:.2f}"
-                    thr_labels[k].update()
-                    apply_btn.disabled = (selected_tier.current == state.model_tier and not _thresholds_dirty())
-                    apply_btn.update()
-
-                slider = ft.Slider(
-                    min=lo, max=hi, value=saved, divisions=int((hi - lo) * 100),
-                    on_change=_on_thr_change,
-                    active_color="#7C6FF7", thumb_color="#7C6FF7",
-                    expand=True, height=32,
-                )
-                thr_sliders[key] = slider
-                adv_panel.controls.append(
-                    ft.Container(
-                        ft.Column([
-                            ft.Row([
-                                ft.Text(label, size=12, color="#A0A8C0", expand=True),
-                                lbl,
-                            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-                            slider,
-                        ], spacing=0, tight=True),
-                        padding=ft.padding.only(bottom=4),
-                    )
-                )
-
-        def _reset_thresholds(_):
-            tier_key = selected_tier.current
-            for key, slider in thr_sliders.items():
-                default = TIER_THRESHOLDS[tier_key][key]
-                slider.value = default
-                thr_labels[key].value = f"{default:.2f}"
-            adv_panel.update()
-            apply_btn.disabled = (tier_key == state.model_tier and not _thresholds_dirty())
-            apply_btn.update()
-
-        adv_toggle = ft.TextButton(
-            "Show technical details ▼",
-            style=ft.ButtonStyle(padding=ft.padding.all(0)),
+        theme_radio = ft.RadioGroup(
+            content=ft.Column([
+                ft.Radio(value="Dark", label="Dark (Default)"),
+                ft.Radio(value="Light", label="Light"),
+                ft.Radio(value="Iron Man", label="Iron Man (HUD)"),
+            ], spacing=2),
+            value=state.current_theme,
+            on_change=lambda e: apply_theme(e.data),
         )
 
-        def _toggle_adv(_):
-            adv_visible.current = not adv_visible.current
-            if adv_visible.current:
-                _build_adv_panel()
-                adv_panel.visible = True
-                adv_toggle.text = "Hide technical details ▲"
-            else:
-                adv_panel.visible = False
-                adv_toggle.text = "Show technical details ▼"
-            adv_panel.update()
-            adv_toggle.update()
+        left_panel = ft.Column([
+            ft.Text("AI Model", size=12, weight=ft.FontWeight.W_700, color="#E0E0E0"),
+            ft.Container(height=4),
+            *[_make_tier_card(t) for t in MODEL_TIERS],
+            ft.Divider(color="#2D3244", height=24),
+            ft.Text("Theme", size=12, weight=ft.FontWeight.W_700, color="#E0E0E0"),
+            ft.Container(height=4),
+            theme_radio,
+        ], spacing=6, width=190)
 
-        adv_toggle.on_click = _toggle_adv
-
-        # ── Download progress ──────────────────────────────────────
+        # ── Download progress bar ──────────────────────────────────
         dl_progress = ft.ProgressBar(value=0, visible=False, expand=True, height=4, color="#7C6FF7")
         dl_status = ft.Text("", size=11, color="#A0A8C0", visible=False)
 
         # ── Apply logic ────────────────────────────────────────────
         def _apply(e):
             new_tier = selected_tier.current
-            new_thresholds = {k: round(s.value, 3) for k, s in thr_sliders.items()} if thr_sliders else state.thresholds
-
-            # Save thresholds immediately
-            state.thresholds = new_thresholds
-            state.settings_manager.set("thresholds", new_thresholds)
+            new_thr = {k: round(s.value, 3) for k, s in thr_sliders.items()} if thr_sliders else state.thresholds
+            state.thresholds = new_thr
+            state.settings_manager.set("thresholds", new_thr)
 
             tier_changed = (new_tier != state.model_tier)
-
             if tier_changed:
                 state.model_tier = new_tier
                 state.settings_manager.set("model_tier", new_tier)
-
-                # Check if download needed
                 c = get_cache_status()
-                needs_download = not (c[new_tier]["clip"] and c[new_tier]["blip"])
-
-                if needs_download:
+                if not (c[new_tier]["clip"] and c[new_tier]["blip"]):
                     dl_progress.visible = True
                     dl_status.visible = True
                     apply_btn.disabled = True
@@ -553,9 +510,8 @@ def main(page: ft.Page):
                     threading.Thread(target=_do_download, daemon=True).start()
                     return
 
-            if tier_changed or new_thresholds != state.thresholds:
+            if tier_changed or new_thr != state.thresholds:
                 _reload_analyzer()
-
             apply_btn.disabled = True
             apply_btn.update()
 
@@ -570,40 +526,26 @@ def main(page: ft.Page):
 
         apply_btn.on_click = _apply
 
-        # ── Assemble dialog ────────────────────────────────────────
-        tier_col = ft.Column(
-            [_make_tier_card(t) for t in MODEL_TIERS],
-            spacing=6,
-        )
+        # ── Initial right panel build ──────────────────────────────
+        _build_right_panel()
 
+        # ── Assemble dialog ────────────────────────────────────────
         dg = ft.AlertDialog(
             title=ft.Text("Settings", size=18, weight=ft.FontWeight.W_600),
             content=ft.Container(
                 ft.Column([
-                    # ── AI Models ──────────────────────────────────
-                    ft.Text("AI Models", weight=ft.FontWeight.W_700, size=13, color="#E0E0E0"),
-                    ft.Container(height=4),
-                    tier_col,
-                    ft.Container(height=2),
-                    adv_toggle,
-                    adv_panel,
-                    # Download progress (hidden until needed)
-                    ft.Container(
-                        ft.Column([
-                            dl_progress,
-                            dl_status,
-                        ], spacing=4, tight=True),
-                        visible=True,
-                    ),
-                    ft.Divider(color="#2D3244", height=20),
-                    # ── Interface Theme ─────────────────────────────
-                    ft.Text("Interface Theme", weight=ft.FontWeight.W_700, size=13, color="#E0E0E0"),
-                    ft.Container(height=4),
-                    theme_radio,
-                ], tight=True, spacing=4, scroll=ft.ScrollMode.AUTO),
-                width=480,
-                height=500,
-                padding=ft.padding.only(right=8),
+                    ft.Row([
+                        left_panel,
+                        ft.VerticalDivider(color="#2D3244", width=1),
+                        ft.Container(
+                            ft.Column([right_panel], scroll=ft.ScrollMode.AUTO, expand=True),
+                            expand=True,
+                            padding=ft.padding.only(left=16),
+                        ),
+                    ], spacing=16, vertical_alignment=ft.CrossAxisAlignment.START, expand=True),
+                    ft.Column([dl_progress, dl_status], spacing=4, tight=True),
+                ], spacing=8, tight=True),
+                width=680, height=440,
             ),
             actions=[
                 apply_btn,
