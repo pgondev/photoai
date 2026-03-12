@@ -96,6 +96,7 @@ class ImageAnalyzer:
             else:
                 self._load_blip(caption_path, caption_exists, cfg, cpu_fallback=True)
 
+        self._precalc_prompts()
         print(f"Models loaded on {self.device} (tier: {self.tier}).")
 
     def _load_blip(self, path, exists, cfg, cpu_fallback=False):
@@ -130,15 +131,15 @@ class ImageAnalyzer:
                 cfg["blip_id"], cache_dir=user_cache, trust_remote_code=True
             ).to(self.device).to(torch.float32)
 
-        # --- 2.2 PRE-CALCULATE PROMPTS (Optimization) ---
-        # Memes / Screenshots / Forwards
+    def _precalc_prompts(self):
+        """Pre-encode meme/screenshot detection prompts for fast reuse. Called from __init__."""
         self._prompts_meme = [
-            "a meme", "a screenshot", "incorrectly cropped image", 
+            "a meme", "a screenshot", "incorrectly cropped image",
             "a twitter post", "a whatsapp chat", "text overlay on image",
             "a funny picture with text"
         ]
         self._prompts_meme_neg = [
-            "a professional photo", "a landscape", "a portrait", 
+            "a professional photo", "a landscape", "a portrait",
             "a clear document", "natural scenery", "a family photo",
             "a barcode", "an id card", "a physical object"
         ]

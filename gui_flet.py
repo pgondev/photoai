@@ -329,24 +329,30 @@ def main(page: ft.Page):
         def _make_tier_card(tier_key):
             cfg = MODEL_TIERS[tier_key]
             is_active = (tier_key == state.model_tier)
-            border_color = "#7C6FF7" if is_active else "#2D3244"
             card = ft.Container(
-                ft.Column([
-                    ft.Row([
-                        ft.Text(cfg["icon"], size=22),
-                        ft.Text(cfg["display_name"], size=14, weight=ft.FontWeight.W_600),
+                ft.Row([
+                    # Left: icon + name + tagline
+                    ft.Column([
+                        ft.Row([
+                            ft.Text(cfg["icon"], size=20),
+                            ft.Text(cfg["display_name"], size=14, weight=ft.FontWeight.W_600),
+                        ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                        ft.Text(cfg["tagline"], size=11, color="#A0A8C0"),
+                    ], spacing=3, expand=True),
+                    # Right: size + cache badge
+                    ft.Column([
                         _cache_badge(tier_key),
-                    ], spacing=6, alignment=ft.MainAxisAlignment.START),
-                    ft.Text(cfg["tagline"], size=11, color="#A0A8C0"),
-                    ft.Text(
-                        format_size(cfg["clip_size_mb"] + cfg["blip_size_mb"]),
-                        size=11, color="#6B7280",
-                    ),
-                ], spacing=4, tight=True),
-                padding=12, border_radius=10,
-                border=ft.border.all(2 if is_active else 1, border_color),
+                        ft.Text(
+                            format_size(cfg["clip_size_mb"] + cfg["blip_size_mb"]),
+                            size=11, color="#6B7280",
+                        ),
+                    ], spacing=4, horizontal_alignment=ft.CrossAxisAlignment.END),
+                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                   vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                padding=ft.padding.symmetric(vertical=10, horizontal=14),
+                border_radius=8,
+                border=ft.border.all(2 if is_active else 1, "#7C6FF7" if is_active else "#2D3244"),
                 bgcolor="#1A1D27" if is_active else "#13151F",
-                width=155,
                 on_click=lambda e, k=tier_key: _select_tier(k),
                 data=tier_key,
             )
@@ -385,22 +391,56 @@ def main(page: ft.Page):
             tier_key = selected_tier.current
             cfg = MODEL_TIERS[tier_key]
 
-            adv_panel.controls.append(ft.Divider(color="#2D3244"))
+            # ── Model info table ───────────────────────────────────
+            adv_panel.controls.append(ft.Divider(color="#2D3244", height=1))
             adv_panel.controls.append(
-                ft.Text("Technical Details", size=12, weight=ft.FontWeight.W_600, color="#A0A8C0")
-            )
-            adv_panel.controls.append(
-                ft.Text(f"CLIP:  {cfg['clip_id']}  ·  {cfg['clip_params']}  ·  {format_size(cfg['clip_size_mb'])}", size=11, color="#6B7280")
-            )
-            adv_panel.controls.append(
-                ft.Text(f"Caption:  {cfg['blip_id']}  ·  {cfg['blip_params']}  ·  {format_size(cfg['blip_size_mb'])}", size=11, color="#6B7280")
+                ft.Text("Model Details", size=12, weight=ft.FontWeight.W_600, color="#E0E0E0")
             )
 
+            def _model_row(role, model_id, params, size_mb, tier_k):
+                cached = cache[tier_k]["clip"] if role == "CLIP" else cache[tier_k]["blip"]
+                badge = ft.Container(
+                    ft.Text("Cached" if cached else "Not downloaded", size=10,
+                            color="#4ADE80" if cached else "#FACC15",
+                            weight=ft.FontWeight.W_600),
+                    padding=ft.padding.symmetric(vertical=1, horizontal=6),
+                    border_radius=8,
+                    border=ft.border.all(1, "#4ADE80" if cached else "#FACC15"),
+                )
+                return ft.Container(
+                    ft.Column([
+                        ft.Row([
+                            ft.Text(role, size=11, color="#7C6FF7", weight=ft.FontWeight.W_600, width=58),
+                            ft.Text(model_id, size=12, weight=ft.FontWeight.W_500, expand=True),
+                            badge,
+                        ], vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=8),
+                        ft.Row([
+                            ft.Container(width=58),
+                            ft.Text(f"{params}  ·  {format_size(size_mb)}", size=11, color="#6B7280"),
+                        ]),
+                    ], spacing=2, tight=True),
+                    padding=ft.padding.symmetric(vertical=8, horizontal=10),
+                    border_radius=6,
+                    bgcolor="#13151F",
+                )
+
+            adv_panel.controls.append(_model_row(
+                "CLIP", cfg["clip_id"], cfg["clip_params"], cfg["clip_size_mb"], tier_key
+            ))
+            adv_panel.controls.append(_model_row(
+                "Caption", cfg["blip_id"], cfg["blip_params"], cfg["blip_size_mb"], tier_key
+            ))
+
+            # ── Threshold sliders ──────────────────────────────────
             adv_panel.controls.append(ft.Container(height=4))
             adv_panel.controls.append(
                 ft.Row([
-                    ft.Text("Detection Thresholds", size=12, weight=ft.FontWeight.W_600, color="#A0A8C0"),
-                    ft.TextButton("Reset to defaults", style=ft.ButtonStyle(padding=0), on_click=_reset_thresholds),
+                    ft.Text("Detection Thresholds", size=12, weight=ft.FontWeight.W_600, color="#E0E0E0"),
+                    ft.TextButton(
+                        "Reset to defaults",
+                        style=ft.ButtonStyle(padding=ft.padding.all(0)),
+                        on_click=_reset_thresholds,
+                    ),
                 ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
             )
 
@@ -409,7 +449,7 @@ def main(page: ft.Page):
             for key, label in THRESHOLD_LABELS.items():
                 lo, hi = THRESHOLD_RANGES[key]
                 saved = state.thresholds.get(key, TIER_THRESHOLDS[tier_key][key])
-                lbl = ft.Text(f"{saved:.2f}", size=11, color="#7C6FF7", width=35)
+                lbl = ft.Text(f"{saved:.2f}", size=12, color="#7C6FF7", weight=ft.FontWeight.W_600)
                 thr_labels[key] = lbl
 
                 def _on_thr_change(e, k=key):
@@ -422,15 +462,20 @@ def main(page: ft.Page):
                     min=lo, max=hi, value=saved, divisions=int((hi - lo) * 100),
                     on_change=_on_thr_change,
                     active_color="#7C6FF7", thumb_color="#7C6FF7",
-                    expand=True,
+                    expand=True, height=32,
                 )
                 thr_sliders[key] = slider
                 adv_panel.controls.append(
-                    ft.Row([
-                        ft.Text(label, size=11, color="#A0A8C0", expand=True),
-                        lbl,
-                        ft.Container(slider, expand=True),
-                    ], spacing=8)
+                    ft.Container(
+                        ft.Column([
+                            ft.Row([
+                                ft.Text(label, size=12, color="#A0A8C0", expand=True),
+                                lbl,
+                            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                            slider,
+                        ], spacing=0, tight=True),
+                        padding=ft.padding.only(bottom=4),
+                    )
                 )
 
         def _reset_thresholds(_):
@@ -526,31 +571,39 @@ def main(page: ft.Page):
         apply_btn.on_click = _apply
 
         # ── Assemble dialog ────────────────────────────────────────
-        tier_row = ft.Row(
+        tier_col = ft.Column(
             [_make_tier_card(t) for t in MODEL_TIERS],
-            spacing=8, wrap=False,
+            spacing=6,
         )
 
         dg = ft.AlertDialog(
-            title=ft.Text("Settings"),
+            title=ft.Text("Settings", size=18, weight=ft.FontWeight.W_600),
             content=ft.Container(
                 ft.Column([
-                    # AI Models
-                    ft.Text("AI Models", weight=ft.FontWeight.W_600, size=13),
-                    ft.Container(height=6),
-                    tier_row,
+                    # ── AI Models ──────────────────────────────────
+                    ft.Text("AI Models", weight=ft.FontWeight.W_700, size=13, color="#E0E0E0"),
                     ft.Container(height=4),
+                    tier_col,
+                    ft.Container(height=2),
                     adv_toggle,
                     adv_panel,
-                    ft.Container(height=2),
-                    ft.Row([dl_progress, dl_status], spacing=8),
-                    ft.Divider(color="#2D3244"),
-                    # Theme
-                    ft.Text("Interface Theme", weight=ft.FontWeight.W_600, size=13),
-                    ft.Container(height=6),
+                    # Download progress (hidden until needed)
+                    ft.Container(
+                        ft.Column([
+                            dl_progress,
+                            dl_status,
+                        ], spacing=4, tight=True),
+                        visible=True,
+                    ),
+                    ft.Divider(color="#2D3244", height=20),
+                    # ── Interface Theme ─────────────────────────────
+                    ft.Text("Interface Theme", weight=ft.FontWeight.W_700, size=13, color="#E0E0E0"),
+                    ft.Container(height=4),
                     theme_radio,
                 ], tight=True, spacing=4, scroll=ft.ScrollMode.AUTO),
-                width=520,
+                width=480,
+                height=500,
+                padding=ft.padding.only(right=8),
             ),
             actions=[
                 apply_btn,
